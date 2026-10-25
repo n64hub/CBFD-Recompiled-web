@@ -15,16 +15,20 @@
 # Those three make the web's change as N64Recomp-browser's commit MERGED_FROM has it; what the web has changed in them
 # since is merged in (apply.cmake --since), so a later web change reaches the page by itself. One that meets recomp/'s
 # lines stops, the file left with conflict markers: merge it into tools/web_*.patch (analysis.cpp: into
-# recomp/n64recomp.patch) by hand and move MERGED_FROM to the commit merged from.
+# recomp/n64recomp.patch) by hand and move MERGED_FROM to the commit merged from. timer.cpp's merge starts later, at
+# TIMER_MERGED_FROM: there the web keeps the runtime's std::set of timers in order by a copy of each timestamp, so
+# osSetTimer rewriting one in game memory can't leave the set out of order, and recomp/'s list under a lock, which has
+# no order to lose, takes none of it. A web from before that commit has timer.cpp's change as MERGED_FROM has it.
 # And one for a file recomp/'s patches add: tools/web_save_states.patch, the runtime's save states built for wasm,
 # which has no native call stack to sign a thread's wait with (the page takes no save states: host/src/frontend.cpp).
 set -e
 cd "$(dirname "$0")/.."
 APPLY=tools/N64Recomp-browser/patches/apply.cmake
 MERGED_FROM=494cc8110de23edbc394d977224d7a498fee04b7 # v0.82.0
-# web_since <name> <tool> <file>: the web's change to a file left out, since MERGED_FROM.
+TIMER_MERGED_FROM=54e69b8287599397f45c803d542467d6c739cac6
+# web_since <name> <tool> <file> [<since>]: the web's change to a file left out, since MERGED_FROM or <since>.
 web_since() {
-    cmake -P $APPLY "$1" "$2" --since $MERGED_FROM "$3"
+    cmake -P $APPLY "$1" "$2" --since "${4:-$MERGED_FROM}" "$3"
 }
 # web_apply <tool> <patch>: unless it is in already.
 web_apply() {
@@ -39,7 +43,9 @@ cmake -P $APPLY hlslpp tools/rt64/src/contrib/hlslpp
 cmake -P $APPLY rt64 tools/rt64 src/hle/rt64_game_frame.h
 web_apply tools/N64ModernRuntime tools/web_save_states.patch
 web_apply tools/N64ModernRuntime tools/web_timer.patch
-web_since N64ModernRuntime tools/N64ModernRuntime ultramodern/src/timer.cpp
+if grep -q TimerSet tools/N64Recomp-browser/patches/N64ModernRuntime.patch; then
+    web_since N64ModernRuntime tools/N64ModernRuntime ultramodern/src/timer.cpp $TIMER_MERGED_FROM
+fi
 cmake -P $APPLY N64ModernRuntime tools/N64ModernRuntime ultramodern/src/timer.cpp
 cmake -P $APPLY N64Recomp tools/N64ModernRuntime/N64Recomp
 cmake -P $APPLY RecompFrontend tools/RecompFrontend
