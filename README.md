@@ -255,7 +255,7 @@ RT64's render to RAM draws each frame a second time at the N64's resolution and 
 on the page too: the camera reads a row of the depth buffer to step aside from walls, and the lens flares read it to
 hide behind them. Without it both read only the game's own "far" fill. A display list that waited for that readback
 took two to three times as long, so the page copies the frame into RDRAM a list late
-(`recompui::renderer::set_render_to_ram_late`): the copy lands when the next list starts, and the list doesn't wait.
+(`recompui::renderer::set_render_to_ram_late`): the copy lands while the next list is drawn, and no list waits.
 The camera steps aside from walls the same way with it. Measured on 2026-10-12 in headless Chrome at 960x720, the bar after Start Game, 60 s a run, runs interleaved,
 under heavy load from other work (CPU 100%, GPU 20-35%). Per list is the wall time of RT64's work on a
 display list, median:
