@@ -214,17 +214,20 @@ draws through WebGPU. `tools/N64Recomp`, `tools/N64ModernRuntime`, `tools/rt64` 
 upstream's own submodules at upstream's commits, and [N64Recomp-browser](https://github.com/n64hub/N64Recomp-browser)
 (`tools/N64Recomp-browser`) adds the web support: `build.sh` applies its `patches/` on top of this game's patches in
 `recomp/` (all of it behind `__EMSCRIPTEN__` or `__wasm__`, so the native game builds as before), and it makes the game a
-page. `tools/web_patch.sh` applies them a project at a time, with three files left out where this game's patches change
+page. `tools/web_patch.sh` applies them a project at a time, with four files left out where this game's patches change
 the same lines: N64Recomp's `src/analysis.cpp`, whose change, finding a jump table in another section,
 `recomp/n64recomp.patch` already makes its own way, rt64's `src/hle/rt64_game_frame.h`, whose one line
-(`buildCallHashMap` taking a sorted vector) `tools/web_rt64_game_frame.patch` puts beside `recomp/rt64.patch`'s, and
+(`buildCallHashMap` taking a sorted vector) `tools/web_rt64_game_frame.patch` puts beside `recomp/rt64.patch`'s,
 the runtime's `ultramodern/src/timer.cpp`, which `recomp/n64modernruntime.patch` rewrites: `tools/web_timer.patch`
 polls for a timer less than 2 ms away there, since the page's timed waits can end late (in Firefox on Windows, on the
-system timer's 15.6 ms tick), as the web's runtime patch does upstream's. Those three are the web's change as the
-N64Recomp-browser commit the script names had it, and what the web has changed in them since is merged in
-(`apply.cmake --since`), so a later web change reaches the page; one that meets this game's lines stops the build.
-timer.cpp's merge starts at a later commit: the web's change there keeps upstream's set of timers in order, and this
-game's list under a lock has no order to lose. Mods
+system timer's 15.6 ms tick), as the web's runtime patch does upstream's, and rt64's `src/hle/rt64_workload_queue.cpp`,
+where the web keeps a hidden page to its game's own frames, with no interpolated ones, beside the line where this game
+pauses interpolation: `tools/web_rt64_workload_queue.patch` makes the web's whole change to it on top of
+`recomp/rt64.patch`'s. Those four are the web's change as the N64Recomp-browser commit the script names had it, and what
+the web has changed in them since is merged in (`apply.cmake --since`), so a later web change reaches the page; one that
+meets this game's lines stops the build. timer.cpp's merge starts at a later commit: the web's change there keeps
+upstream's set of timers in order, and this game's list under a lock has no order to lose. rt64_workload_queue.cpp is
+left out only from the commit that brings the hidden page's line on. Mods
 are off on the page: the runtime can't recompile a mod's code there. So are save states: the runtime tells where each
 game thread waits by its native call stack, which wasm can't walk at every wait, so `tools/web_save_states.patch` builds
 that file without one and the page sets no save state keys (`host/src/frontend.cpp`).
