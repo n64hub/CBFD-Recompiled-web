@@ -50,7 +50,11 @@ WORKLOAD_QUEUE=
 if grep -q 'generateInterpolatedFrames && !ext.presentQueue->ext.swapChain->isHidden()' \
         tools/N64Recomp-browser/patches/rt64.patch; then
     WORKLOAD_QUEUE=src/hle/rt64_workload_queue.cpp
-    web_apply tools/rt64 tools/web_rt64_workload_queue.patch
+    # In already if its hidden-page line is: once the merge below has brought the web's later change to the file in,
+    # the patch no longer comes out of it, and a second run (host/CMakeLists.txt's, after build.sh's) would apply it
+    # again and fail.
+    grep -q 'swapChain->isHidden()' tools/rt64/$WORKLOAD_QUEUE ||
+        web_apply tools/rt64 tools/web_rt64_workload_queue.patch
     web_since rt64 tools/rt64 $WORKLOAD_QUEUE $WORKLOAD_QUEUE_MERGED_FROM
 fi
 cmake -P $APPLY plume tools/rt64/src/contrib/plume
