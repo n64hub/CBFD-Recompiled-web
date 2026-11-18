@@ -13,8 +13,8 @@
 > for: what it turns up is fixed there where it can be, so every recomp's page gets the fix.
 
 **Play it in the browser: https://n64hub.com/conker/**, with your own ROM, picked in the
-launcher and kept in the browser. It needs WebGPU (Chrome or Edge 113 and up). The page is built from this branch
-and published with N64Recomp-browser's `tools/publish_page.sh`, so it can be a commit or two behind.
+launcher and kept in the browser. It needs WebGPU (Chrome or Edge 113 and up). The page is built from this branch, so it
+can be a commit or two behind.
 
 A native PC port of **Conker's Bad Fur Day** (N64, US version). It's built by
 statically recompiling the game with [N64Recomp](https://github.com/N64Recomp/N64Recomp),
@@ -328,10 +328,6 @@ in Windy (#98), and drops sprite pieces under a pixel across, which crashed by W
 Haunted Barrel Roll, the bank and Windy's The Queen's lost her Home! reaches neither crash, and the page before the
 merge plays it without one too: upstream's route that halted is the barrel up Windy's water, the money and out to
 Birdy, and the beehive's crash comes after the Queen Bee.
-
-How the page plays, in each browser and on which GPU, is recorded in N64Recomp-browser's
-[plays.jsonl](https://github.com/n64hub/N64Recomp-browser/blob/main/plays.jsonl) and its
-[games table](https://github.com/n64hub/N64Recomp-browser#games).
 
 ## What the build does
 
