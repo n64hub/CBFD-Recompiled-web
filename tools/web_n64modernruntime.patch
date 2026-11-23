@@ -1,0 +1,632 @@
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index f33320a..445556e 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -9,7 +9,18 @@ namespace recomp {
+     // 512GB (kseg0 size)
+     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
+     // 4GB (the full address space)
++#ifdef __EMSCRIPTEN__
++    // A 32-bit address space can't reserve 4 GiB, and WebAssembly memory has no page protection to catch stray
++    // accesses with anyway. A recomp built with RECOMP_KUSEG_WINDOW gets KUSEG's window right after kseg0 (recomp.h).
++#ifdef RECOMP_KUSEG_WINDOW
++    static_assert(RECOMP_KUSEG_WINDOW_BASE == mem_size);
++    constexpr size_t allocation_size = mem_size + RECOMP_KUSEG_WINDOW_SIZE;
++#else
++    constexpr size_t allocation_size = mem_size;
++#endif
++#else
+     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
++#endif
+     // Reserved and never accessible on each side of it: a 16-bit offset's reach, rounded up to whole pages.
+     constexpr size_t rdram_guard = 64ULL * 1024ULL;
+     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+@@ -28,6 +39,13 @@ namespace recomp {
+     constexpr uint32_t rom_base = 0x10000000;
+     constexpr uint32_t drive_base = 0x06000000;
+ 
++    // Makes [vaddr, vaddr + size) of KUSEG (TLB-mapped addresses, below 0x80000000) readable and writable, for a recomp
++    // whose code reads its strings, tables and constants through them: on a native build by opening the pages of
++    // allocation_size's range it reserves there, and on the web if the range lies in the window RECOMP_KUSEG_WINDOW
++    // allocates (recomp.h). It starts zeroed, and the recomp fills it (do_rom_read writes through these addresses).
++    // False if the range can't be opened: on the web past the window, or without RECOMP_KUSEG_WINDOW.
++    bool make_kuseg_accessible(uint8_t* rdram, uint32_t vaddr, uint32_t size);
++
+     void register_heap_exports();
+     void init_heap(uint8_t* rdram, uint32_t address);
+     void* alloc(uint8_t* rdram, size_t size);
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 2fdd7a1..9c38fe3 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -25,6 +25,9 @@
+ #include "librecomp/addresses.hpp"
+ #include "librecomp/mods.hpp"
+ #include "recompiler/live_recompiler.h"
++#ifdef RECOMP_ROM_ARCHIVES
++#include "rom_archive.hpp"
++#endif
+ 
+ #ifdef _WIN32
+ #    define WIN32_LEAN_AND_MEAN
+@@ -33,6 +36,13 @@
+ #    include <sys/mman.h>
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++#    include <fcntl.h>
++#    include <sys/stat.h>
++#    include <unistd.h>
++#    include <emscripten.h>
++#endif
++
+ #if defined(_WIN32)
+ #define PATHFMT "%ls"
+ #else
+@@ -91,7 +101,9 @@ bool recomp::register_game(const recomp::GameEntry& entry) {
+ }
+ 
+ void recomp::mods::initialize_mods() {
++#ifndef __EMSCRIPTEN__
+     N64Recomp::live_recompiler_init();
++#endif
+     std::filesystem::create_directories(config_path / mods_directory);
+     std::filesystem::create_directories(config_path / mod_config_directory);
+     mod_context->set_mods_config_path(config_path / "mods.json");
+@@ -103,6 +115,11 @@ void recomp::mods::register_embedded_mod(const std::string &mod_id, std::span<co
+     mod_context->register_embedded_mod(mod_id, mod_bytes);
+ }
+ 
++void recomp::mods::register_precompiled_mod(const recomp_precompiled_mod& code) {
++    std::lock_guard<std::mutex> lock(mod_context_mutex);
++    mod_context->register_precompiled_mod(code);
++}
++
+ void recomp::mods::register_deprecated_mod(const std::string& mod_id, recomp::mods::DeprecationStatus deprecation_status, const Version& maximum_version) {
+     std::lock_guard<std::mutex> lock(mod_context_mutex);
+     mod_context->register_deprecated_mod(mod_id, deprecation_status, maximum_version);
+@@ -178,6 +195,29 @@ static bool rom_matches(const std::vector<uint8_t>& rom_data, const recomp::Game
+ static std::vector<uint8_t> read_file(const std::filesystem::path& path) {
+     std::vector<uint8_t> ret;
+ 
++#ifdef __EMSCRIPTEN__
++    // A page's files are in the page's thread's file system, and every read from another thread waits for that thread:
++    // an ifstream reads a ROM there 1 KB at a time, 65,536 round trips for a 64 MB one (0.5 s in Chrome), and the
++    // launcher, which loads the ROM, draws nothing meanwhile. So it is read in 4 MB pieces, a millisecond or two each.
++    int fd = open(path.c_str(), O_RDONLY);
++    struct stat st;
++    if (fd >= 0 && fstat(fd, &st) == 0) {
++        ret.resize(st.st_size);
++        size_t done = 0;
++        while (done < ret.size()) {
++            ssize_t got = read(fd, ret.data() + done, std::min<size_t>(ret.size() - done, 4 << 20));
++            if (got <= 0) {
++                break;
++            }
++            done += got;
++        }
++        ret.resize(done);
++    }
++    if (fd >= 0) {
++        close(fd);
++    }
++    return ret;
++#else
+     std::ifstream file{ path, std::ios::binary};
+ 
+     if (file.good()) {
+@@ -189,9 +229,31 @@ static std::vector<uint8_t> read_file(const std::filesystem::path& path) {
+     }
+ 
+     return ret;
++#endif
+ }
+ 
+ bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
++#ifdef __EMSCRIPTEN__
++    // A page stores the ROM Load ROM picked on a thread of its own (RecompFrontend's picker), so the launcher's thread
++    // can check the stored ROMs while it is being written, and check_stored_rom deletes a stored ROM whose hash is wrong,
++    // a half-written one too: the rest went to a deleted file, select_rom still said Good, and Start Game then found no
++    // ROM. So it is written beside the stored one and renamed over it whole.
++    std::filesystem::path temp_path = path;
++    temp_path += ".temp";
++    {
++        std::ofstream out_file{ temp_path, std::ios::binary };
++        if (!out_file.good()) {
++            return false;
++        }
++        out_file.write(reinterpret_cast<const char*>(data.data()), data.size());
++        if (!out_file.good()) {
++            return false;
++        }
++    }
++    std::error_code ec;
++    std::filesystem::rename(temp_path, path, ec);
++    return !ec;
++#else
+     std::ofstream out_file{ path, std::ios::binary };
+ 
+     if (!out_file.good()) {
+@@ -201,6 +263,7 @@ bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& d
+     out_file.write(reinterpret_cast<const char*>(data.data()), data.size());
+ 
+     return true;
++#endif
+ }
+ 
+ bool check_stored_rom(const recomp::GameEntry& game_entry) {
+@@ -373,6 +436,13 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
+         return recomp::RomValidationError::OtherError;
+     }
+ 
++#ifdef RECOMP_ROM_ARCHIVES
++    // An archive: the ROM inside it (rom_archive_select.cpp).
++    if (std::optional<recomp::RomValidationError> archive_result = recomp::select_rom_in_archive(rom_path, game_id)) {
++        return *archive_result;
++    }
++#endif
++
+     const recomp::GameEntry& game_entry = find_it->second;
+ 
+     std::vector<uint8_t> rom_data = read_file(rom_path);
+@@ -451,13 +521,9 @@ extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
+         changed &= ~(uint32_t)StatusReg::FR;
+     }
+ 
+-    // If any other bits were changed, assert false as they're not handled currently
+-    if (changed) {
+-        printf("Unhandled status register bits changed: 0x%08X\n", changed);
+-        assert(false);
+-        exit(EXIT_FAILURE);
+-    }
+-    
++    // The other bits (the interrupt mask, CU0-CU3, KSU, EXL, ERL) change nothing for recompiled code, which takes no
++    // interrupts or exceptions and always has its FPU: they're stored for cop0_status_read, as the CPU keeps them.
++
+     // Update the status register in the context
+     ctx->status_reg = new_sr;
+ }
+@@ -503,6 +569,25 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
+     func(rdram, &ctx);
+ }
+ 
++uint8_t recomp::get_controller_pak_ports() {
++    if (!current_game.has_value()) {
++        return 0;
++    }
++    auto find_it = game_roms.find(current_game.value());
++    return find_it == game_roms.end() ? 0 : find_it->second.controller_pak_ports;
++}
++
++int recomp::get_controller_pak_banks(int port) {
++    if (!current_game.has_value()) {
++        return 1;
++    }
++    auto find_it = game_roms.find(current_game.value());
++    if (find_it == game_roms.end() || find_it->second.controller_pak_banks == nullptr) {
++        return 1;
++    }
++    return find_it->second.controller_pak_banks(port);
++}
++
+ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
+     // Initialize the overlays
+     recomp::overlays::init_overlays();
+@@ -729,6 +814,16 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+             {
+                 if (!recomp::load_stored_rom(current_game.value())) {
+                     ultramodern::error_handling::message_box("Error opening stored ROM! Please restart this program.");
++#ifdef __EMSCRIPTEN__
++                    // The game went on with no ROM and a page trapped out of bounds on a worker, its last word, so it
++                    // goes back to the launcher instead, as when its mods don't load. Only with no ROM at all: a recomp
++                    // that keeps no stored ROM hands the runtime the ROM's bytes itself (set_rom_contents) before it
++                    // starts the game, finds no stored one every time, and goes on with the ROM it gave.
++                    if (!recomp::is_rom_loaded()) {
++                        game_status.store(GameStatus::None);
++                        return false;
++                    }
++#endif
+                 }
+ 
+                 auto find_it = game_roms.find(current_game.value());
+@@ -775,6 +870,16 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+                 save_type = game_entry.save_type;
+                 ultramodern::init_saving(rdram);
+ 
++#ifdef __EMSCRIPTEN__
++                // What the renderer must build before the game draws (RT64's prebuilt shaders for the game's boot, where
++                // the browser builds pipelines in line with its other GPU work) is built now, before the game's first
++                // sound, which the same wait at its first frames cut short for 0.1-11.7 s in Firefox.
++                ultramodern::renderer::prepare_for_game();
++
++                // Tells the page its game is running, past the launcher: the shell's on-screen controller shows from here.
++                MAIN_THREAD_ASYNC_EM_ASM({ if (Module.gameStarted) Module.gameStarted(); });
++#endif
++
+                 try {
+                     game_entry.entrypoint(rdram, context);
+                 } catch (ultramodern::thread_terminated& terminated) {
+@@ -962,14 +1067,14 @@ void recomp::start(const recomp::Configuration& cfg) {
+     uint8_t* allocation;
+     bool alloc_failed;
+ #ifdef _WIN32
++    // Reserve the whole range and commit only the memory size: committed pages count against Windows' commit limit
++    // even when they can't be accessed, and reserved ones fault on access just the same.
+     allocation = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size + 2 * rdram_guard, MEM_RESERVE, PAGE_NOACCESS));
+     rdram = allocation + rdram_guard;
+-    DWORD old_protect = 0;
+     alloc_failed = (allocation == nullptr);
+     if (!alloc_failed) {
+-        // VirtualAlloc returns null on failure.
+-        alloc_failed = (VirtualAlloc(rdram, allocation_size, MEM_COMMIT, PAGE_NOACCESS) == nullptr) ||
+-            (VirtualProtect(rdram, mem_size, PAGE_READWRITE, &old_protect) == 0);
++        // VirtualAlloc returns nullptr on failure.
++        alloc_failed = (VirtualAlloc(rdram, mem_size, MEM_COMMIT, PAGE_READWRITE) == nullptr);
+         if (alloc_failed) {
+             VirtualFree(allocation, 0, MEM_RELEASE);
+         }
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 47d1957..f0a7dc9 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -44,7 +44,11 @@ struct DummyWorkloadAction {
+ // The last frame shown again (the timeline has stopped).
+ struct PresentAgainAction {};
+ 
+-using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction, DummyWorkloadAction, PresentAgainAction>;
++struct PrepareForGameAction {
++    moodycamel::LightweightSemaphore* done;
++};
++
++using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction, DummyWorkloadAction, PresentAgainAction, PrepareForGameAction>;
+ 
+ struct ViState {
+     const OSViMode* mode = nullptr;
+@@ -59,6 +63,24 @@ struct ViState {
+ #define VI_STATE_BLACK 0x20
+ #define VI_STATE_REPEATLINE 0x40
+ 
++// The graphics thread's actions, taken in the order they were queued, whichever thread queued them. A moodycamel queue
++// keeps one thread's order only: each thread queues into a list of its own, and a dequeue takes from the list that
++// holds the most. The VI thread queues its ScreenUpdateAction for the framebuffer it showed before it moves on to the
++// next one, and a game then draws its next frame into that framebuffer: its graphics task could run first, and the
++// screen showed the framebuffer with the next frame's first lists drawn into it (Mario Party 1's flash of a new scene
++// before its star wipe opens, 9 presents in 12,225 on a busy host). Every thread queues through one producer token.
++struct ActionQueue : moodycamel::BlockingConcurrentQueue<Action> {
++    moodycamel::ProducerToken token{ *this };
++    std::mutex mutex;
++
++    ActionQueue() {}
++
++    bool enqueue(Action action) {
++        std::lock_guard lock{ mutex };
++        return BlockingConcurrentQueue::enqueue(token, std::move(action));
++    }
++};
++
+ static struct {
+     struct {
+         std::thread thread;
+@@ -142,7 +164,7 @@ static struct {
+     // The same message queue may be used for multiple events, so share a mutex for all of them
+     std::mutex message_mutex;
+     uint8_t* rdram;
+-    moodycamel::BlockingConcurrentQueue<Action> action_queue{};
++    ActionQueue action_queue{};
+     moodycamel::BlockingConcurrentQueue<OSTask*> sp_task_queue{};
+     moodycamel::ConcurrentQueue<OSThread*> deleted_threads{};
+ } events_context{};
+@@ -185,6 +207,195 @@ uint64_t total_vis = 0;
+ 
+ 
+ extern std::atomic_bool exited;
++
++#if defined(__EMSCRIPTEN_PTHREADS__)
++#include <algorithm>
++#include <cerrno>
++#include <climits>
++#include <cstdio>
++#include <emscripten/emscripten.h>
++#include <emscripten/html5.h>
++#include <emscripten/proxying.h>
++#include <emscripten/threading.h>
++
++// On a page the VI thread's timed sleep can end long after the VI's time: in Firefox on Windows every timed wait off the
++// page's thread ends on the system timer's tick (15.6 ms unless the browser's process asks for a finer one), so VIs came
++// 15.6 or 31.2 ms apart instead of 16.7. RT64 reads a game's rate from how many VIs each of its frames was shown for,
++// and from those it read GoldenEye, a new frame at nearly every VI, as a game at 30 about 5 times a second, made two
++// presents of each of those frames, and presented 63-64 a second on a 60 Hz display. So where a timed wait ends late,
++// the VI thread waits for the browser's animation frames, whose futex wake comes at once, and a VI comes at the first
++// frame less than half a VI before its time: on a 60 Hz display every VI is a frame apart. A timed wait to the VI's time
++// stays as the fallback, for a page whose frames have stopped (hidden). Elsewhere (Chrome, a finer timer) the VI thread
++// sleeps as before.
++// It sits up here, apart from vi_thread_func, because a recomp's own patch to the VI thread adds its state just above
++// that function (CBFD-Recompiled's remaining_retraces), and a block there kept such a patch from applying.
++namespace {
++    // Whether a timed wait off the page's thread ends late, judged as plume's timedWaitsEndLate() judges it: first three
++    // waits of 100 us, late if the shortest took more than 4 ms, then while that judged them on time the VI thread's own
++    // (vi_wait_ended()). A page's waits can turn as it plays: in Firefox 158 on a desktop the same page's ended 140 ms past
++    // their time in its launcher and 0.1 ms past it once its game ran, or stayed late all through.
++    bool vi_late = false;
++
++    bool vi_waits_end_late() {
++        [[maybe_unused]] static const bool measured = []() {
++            uint32_t futex = 0;
++            double shortest = 1e9;
++            for (int i = 0; i < 3; i++) {
++                const double start = emscripten_get_now();
++                emscripten_futex_wait(&futex, 0, 0.1);
++                shortest = std::min(shortest, emscripten_get_now() - start);
++            }
++
++            vi_late = shortest > 4.0;
++            return true;
++        }();
++
++        return vi_late;
++    }
++
++    // A timed wait of the VI thread's that ended over_ms past its time: waits judged on time turn late once most of those
++    // in each of 10 seconds in a row ended more than 4 ms past their time, and stay late, as plume's timedWaitEnded()
++    // judges the present thread's.
++    void vi_wait_ended(double over_ms) {
++        static double second_start = 0.0;
++        static uint32_t second_waits = 0;
++        static uint32_t second_late_waits = 0;
++        static uint32_t late_seconds = 0;
++        const double now = emscripten_get_now();
++        if (second_start == 0.0) {
++            second_start = now;
++        }
++
++        second_waits++;
++        second_late_waits += (over_ms > 4.0) ? 1 : 0;
++        if ((now - second_start) < 1000.0) {
++            return;
++        }
++
++        late_seconds = ((second_late_waits * 2) > second_waits) ? (late_seconds + 1) : 0;
++        second_start = now;
++        second_waits = 0;
++        second_late_waits = 0;
++        if (late_seconds >= 10) {
++            vi_late = true;
++            fprintf(stderr, "ultramodern: most of the VI thread's timed waits ended over 4 ms late for 10 s, so VIs come on the browser's animation frames from now on\n");
++        }
++    }
++
++    // The browser's animation frames, counted on the page's thread: a futex woken at each. Only the count crosses
++    // threads: the VI thread times a frame by when its wake reaches it, since a time read on the page's thread and one
++    // read on another don't agree in Firefox (each context's own performance.timeOrigin), and comparing them sent VIs
++    // 1,500-1,800 a second. Firefox also calls back 0.1-5 ms after a frame now and then, which isn't a frame of the display.
++    std::atomic<uint32_t> vi_frame_serial{ 0 };
++
++    bool vi_animation_frame(double, void*) {
++        static double last = 0.0;
++        const double now = emscripten_get_now();
++        if ((now - last) >= 5.0) {
++            last = now;
++            vi_frame_serial++;
++            emscripten_futex_wake(&vi_frame_serial, INT_MAX);
++        }
++
++        return true;
++    }
++
++    void vi_start_frames(void*) {
++        emscripten_request_animation_frame_loop(vi_animation_frame, nullptr);
++    }
++
++    // Holds the VI thread until about the given time, ending on the first animation frame to come less than half a VI
++    // before it, or at the time if none comes by then. False where a timed wait ends on time, and the caller sleeps itself.
++    // While timed waits are judged on time it first waits up to 100 us for a frame, no longer than the caller's own sleep
++    // would have taken, and judges that wait if it ended on its time (vi_wait_ended()): a frame's wake says nothing of
++    // the timer.
++    bool vi_sleep_until(const std::chrono::high_resolution_clock::time_point& time_point) {
++        if (!vi_waits_end_late() && ((time_point - std::chrono::high_resolution_clock::now()) > std::chrono::microseconds(500))) {
++            const double start = emscripten_get_now();
++            if (emscripten_futex_wait(&vi_frame_serial, vi_frame_serial, 0.1) == -ETIMEDOUT) {
++                vi_wait_ended(emscripten_get_now() - start - 0.1);
++            }
++        }
++
++        if (!vi_waits_end_late()) {
++            return false;
++        }
++
++        [[maybe_unused]] static const bool started = []() {
++            emscripten_proxy_async(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(), vi_start_frames, nullptr);
++            fprintf(stderr, "ultramodern: timed waits end late on this page, so VIs come on the browser's animation frames\n");
++            return true;
++        }();
++
++        const double end = emscripten_get_now() + std::chrono::duration<double, std::milli>(time_point - std::chrono::high_resolution_clock::now()).count();
++        const double from = end - 1000.0 / (2 * 60 * ultramodern::get_speed_multiplier());
++        uint32_t serial = vi_frame_serial;
++        for (;;) {
++            const double now = emscripten_get_now();
++            const uint32_t current = vi_frame_serial;
++            if ((now >= end) || ((current != serial) && (now >= from))) {
++                return true;
++            }
++
++            serial = current;
++            emscripten_futex_wait(&vi_frame_serial, serial, end - now);
++        }
++    }
++}
++#endif
++
++#if ULTRAMODERN_VIS_WAIT_FOR_RENDERER
++// The VI thread sends no VI while the graphics thread has spent more than a few VIs on one action. The thread tells the
++// game its RSP task is done before the renderer reads the list (gfx_thread_func), and a console's RSP has read it a few
++// ms later, so a game can step its logic every VI whatever its lists do: Paper Mario's runs before it checks how many
++// tasks are pending, which holds back only its drawing. On a page the renderer's thread can stop for seconds in one
++// list, waiting for a readback while the browser builds pipelines (Firefox builds them in line with the device, 4-10 s
++// for a section of the prebuilt shader list). Paper Mario's attract demo went on to its next map in that time, and the
++// list the renderer was still reading pointed at what the map's load had put there since: a function pointer read
++// 0x00010001 and the page trapped, or it trapped in malloc, or it stopped drawing. Held, the game sees the stall as a
++// console would never show it, one long VI.
++// A stall is two VIs, not six: a page whose every list took about 100 ms left the game six VIs behind each one. In
++// Firefox, its tab hidden on a busy host, Paper Mario's lists took 50-230 ms each (its render to RAM's readbacks waiting
++// on the page's thread), the game stepped its logic three times behind each, and as its intro story handed over to the
++// attract demo it freed what the list in hand pointed at: it trapped in its heap allocator, the free list corrupt, or
++// stopped drawing for good, 4-6 s after the hide in 3 plays of 3. Held after two VIs, as a console's RDP is done with a
++// list a VI or two after it starts, it came through and went on into the demo.
++// Nor once the renderer has told the game the list in hand is done (renderer::rdp_done): it reads nothing more of RDRAM
++// for it, and what is left is its own work, the wait for a busy GPU included. Held there, the game's clock stopped for
++// nothing, and its sound with it, which nothing makes up afterwards: Rush 2049's page in Firefox, uncapped and its tab
++// hidden, held its VIs 91-105 times a play (9.5-11.9 s in all) and its sound ran 238,000-253,000 frames short, most of
++// it through a 5 s wait for a section's prebuilt shaders as its attract race starts; lifted at the RDP's done, it held 4
++// times (only before its sound starts) and lost none.
++// Both sides touch only lines a game fork's own patches to this file leave alone (DKR-R-web's rewrite the VI messages'
++// block and the graphics thread's actions).
++namespace {
++    // The graphics thread's turns of its loop: waiting for an action, it comes round every 1 ms (a timed wait's tick in
++    // Firefox, 15.6 ms). A count, not a time: a time read on one thread and one read on another don't agree on a page
++    // in Firefox (each worker's own performance.timeOrigin), so only the VI thread's own clock times it.
++    std::atomic<uint32_t> renderer_loop_turns{ 0 };
++
++    // Two VIs: a list or screen update takes a few ms. The VI thread looks once a VI, so a game gets two or three VIs of
++    // an action before the hold. Over a timed wait's tick in Firefox (15.6 ms), so an idle thread isn't taken for one.
++    constexpr std::chrono::milliseconds renderer_stall_limit{ 30 };
++
++    // Whether the graphics thread has made no turn for renderer_stall_limit, as the VI thread (its only caller) has seen.
++    // None before its loop's first turn.
++    bool renderer_stalled() {
++        static uint32_t seen_turns = 0;
++        static std::chrono::steady_clock::time_point seen_time{};
++        const uint32_t turns = renderer_loop_turns.load();
++        const auto now = std::chrono::steady_clock::now();
++        if ((turns == 0) || (turns != seen_turns) || ultramodern::renderer::rdp_done_pending()) {
++            seen_turns = turns;
++            seen_time = now;
++            return false;
++        }
++
++        return (now - seen_time) > renderer_stall_limit;
++    }
++}
++#endif
++
+ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ 
+ void set_dummy_vi(bool odd);
+@@ -302,6 +513,20 @@ void vi_thread_func() {
+             // printf("Skipping the next VI wait\n");
+             next = std::chrono::high_resolution_clock::now();
+         }
++#if ULTRAMODERN_VIS_WAIT_FOR_RENDERER
++        // No VI while the graphics thread is stalled in one action (renderer_stalled()); the next comes once it isn't.
++        while (renderer_stalled() && !exited) {
++            std::this_thread::sleep_for(1ms);
++        }
++#endif
++#if defined(__EMSCRIPTEN_PTHREADS__)
++        // A VI that ended on a frame leaves the timed wait below nothing to wait for. That wait stays where it was, so
++        // a recomp's own patches to this loop still apply.
++        const bool vi_on_frame = vi_sleep_until(next);
++        if (vi_on_frame) {
++            next = std::chrono::high_resolution_clock::now();
++        }
++#endif
+         ultramodern::sleep_until(next);
+         // In deterministic mode the timeline has the VIs. While it gives none for a moment (the game waits: a
+         // netplay read waiting for the others), the last frame is shown again every so often, so what the host
+@@ -322,6 +547,13 @@ void vi_thread_func() {
+         auto time_now = ultramodern::time_since_start();
+         // Calculate how many VIs have passed
+         uint64_t new_total_vis = (time_now * (60 * ultramodern::get_speed_multiplier()) / 1000ms) + 1;
++#if defined(__EMSCRIPTEN_PTHREADS__)
++        // A VI that ended on a frame before its time is that VI all the same: counted from the time, it would be the one
++        // before it again, sent a second time at the next frame (VIs came 64-91 a second).
++        if (vi_on_frame) {
++            new_total_vis = std::max(new_total_vis, total_vis + 1);
++        }
++#endif
+         if (new_total_vis > total_vis + 1) {
+             //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
+         }
+@@ -336,12 +568,20 @@ void vi_thread_func() {
+             events_context.action_queue.enqueue(DummyWorkloadAction{events_context.vi.get_next_state()->framebuffer});
+         }
+ 
++#if ULTRAMODERN_SCREEN_UPDATE_AFTER_VI
++        // The screen update shows the framebuffer this VI swaps in, queued right behind the workloads that drew it and
++        // before the next frame's. Queued before the swap, it showed the one swapped in at the VI before: a VI late, after
++        // the next frame's first workloads, where RT64_GAME_FRAME_WORKLOADS ends a game frame at its framebuffer's present.
++        events_context.vi.update_vi();
++        events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
++#else
+         // Queue a screen update for the graphics thread with the current VI register state.
+         // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
+         events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+ 
+         // Update VI registers and swap VI modes.
+         events_context.vi.update_vi();
++#endif
+ 
+         // If the game has started, handle sending VI and AI events.
+         if (ultramodern::is_game_started()) {
+@@ -370,12 +610,24 @@ void vi_thread_func() {
+ }
+ 
+ void sp_complete() {
++#if ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS
++    // A graphics task's RSP done went already if a yield was asked of it while it waited (rsp::yield_asked).
++    if ((std::this_thread::get_id() == events_context.sp.gfx_thread.get_id()) && !ultramodern::rsp::graphics_sp_due()) {
++        return;
++    }
++#endif
++
+     uint8_t* rdram = events_context.rdram;
+     std::lock_guard lock{ events_context.message_mutex };
+     ultramodern::enqueue_external_message_src(events_context.sp.mq, events_context.sp.msg, false, ultramodern::EventMessageSource::Sp);
+ }
+ 
+ void dp_complete() {
++    // Sent already if the renderer sent it before send_dl returned (ultramodern::renderer::rdp_done).
++    if (ultramodern::renderer::take_rdp_done()) {
++        return;
++    }
++
+     uint8_t* rdram = events_context.rdram;
+     std::lock_guard lock{ events_context.message_mutex };
+     ultramodern::enqueue_external_message_src(events_context.dp.mq, events_context.dp.msg, false, ultramodern::EventMessageSource::Dp);
+@@ -437,6 +689,15 @@ void ultramodern::trigger_config_action() {
+     events_context.action_queue.enqueue(UpdateConfigAction{});
+ }
+ 
++// The graphics thread takes it after every action queued before it: the launcher's lists and screen updates, all of
++// them the renderer's before the game's. With Emscripten the VI thread sends no VI while the renderer is in it
++// (renderer_stalled()), so the game, its audio interrupts included, starts after it, as if it had started then.
++void ultramodern::renderer::prepare_for_game() {
++    moodycamel::LightweightSemaphore done;
++    events_context.action_queue.enqueue(PrepareForGameAction{ &done });
++    done.wait();
++}
++
+ std::atomic<ultramodern::renderer::SetupResult> renderer_setup_result = ultramodern::renderer::SetupResult::Success;
+ std::atomic<ultramodern::renderer::GraphicsApi> renderer_chosen_api = ultramodern::renderer::GraphicsApi::Auto;
+ 
+@@ -471,6 +732,9 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+     while (!exited) {
+         // Try to pull an action from the queue
+         Action action;
++#if ULTRAMODERN_VIS_WAIT_FOR_RENDERER
++        renderer_loop_turns++;
++#endif
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+@@ -526,6 +790,10 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 renderer_context->present_again();
+                 present_again_queued = false;
+             }
++            else if (const auto* prepare_action = std::get_if<PrepareForGameAction>(&action)) {
++                renderer_context->prepare_for_game();
++                prepare_action->done->signal();
++            }
+         }
+     }
+ 
