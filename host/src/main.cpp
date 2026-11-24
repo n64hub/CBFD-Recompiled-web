@@ -475,6 +475,10 @@ namespace {
         }
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
+#elif defined(__EMSCRIPTEN__)
+        // Not on a page: it registers no Return to Launcher (frontend.cpp), and a page can't start itself again.
+        (void)argc;
+        (void)exe;
 #else
         std::vector<char*> args{ argv[0] };
         for (int i = 1; i + 1 < argc; i++) {
