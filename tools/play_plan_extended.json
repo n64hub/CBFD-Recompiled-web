@@ -15,7 +15,7 @@
   "page": "ConkerRecomp.html",
   "load": [["until","RT64: all \\d+ prebuilt shaders built|once the game draws",60000],["wait",7000]],
   "setup": [["rom",628,456],["until","ROM version in play: [^n]",30000],["wait",1000]],
-  "start": [["click",628,365],["wait",6000]],
+  "start": [["click",628,383],["until","Initializing recomp heap",20000],["wait",4000]],
   "play": [
     ["evalFile","shader_survey.js"],
     ["need","startAt(10, 6, 12000)"],

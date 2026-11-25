@@ -34,7 +34,7 @@
   ["wait", 1000]
  ],
  "start": [
-  ["click", 628, 365],
+  ["click", 628, 383],
   ["until", "Initializing recomp heap", 20000],
   ["wait", 4000]
  ],
