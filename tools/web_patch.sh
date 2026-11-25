@@ -47,9 +47,23 @@
 # as MERGED_FROM has it.
 # And one for a file recomp/'s patches add: tools/web_save_states.patch, the runtime's save states built for wasm,
 # which has no native call stack to sign a thread's wait with (the page takes no save states: host/src/frontend.cpp).
+# A second run over checkouts the last one left as they are (host/CMakeLists.txt's, after build.sh's) does nothing:
+# once a merge since a MERGED_FROM has brought the web's later changes in, the patch made at it no longer comes out of
+# them, so web_apply's check that it is in already fails and applying it again would too. The last run's patches and
+# the checkouts' changes it left are kept as one hash in the clone's git dir (web_patched).
 set -e
 cd "$(dirname "$0")/.."
 APPLY=tools/N64Recomp-browser/patches/apply.cmake
+# web_state: the patches this run applies and the changes in the checkouts it patches, as one hash.
+web_state() {
+    { cat recomp/*.patch tools/web_patch.sh tools/web_*.patch tools/N64Recomp-browser/patches/*.patch
+      for tool in tools/N64Recomp tools/N64ModernRuntime tools/rt64 tools/RecompFrontend; do
+          git -C $tool diff HEAD
+          git -C $tool submodule foreach --recursive -q 'git diff HEAD'
+      done; } | git hash-object --stdin
+}
+STAMP="$(git rev-parse --absolute-git-dir)/web_patched"
+[ "$(cat "$STAMP" 2>/dev/null)" != "$(web_state)" ] || exit 0
 MERGED_FROM=494cc8110de23edbc394d977224d7a498fee04b7 # v0.82.0
 TIMER_MERGED_FROM=54e69b8287599397f45c803d542467d6c739cac6
 WORKLOAD_QUEUE_MERGED_FROM=726888e95c011a8ba208c10e133dbaa33c4d0a9b
@@ -103,3 +117,4 @@ cmake -P $APPLY RecompFrontend tools/RecompFrontend --since $FRONTEND_MERGED_FRO
 cmake -P $APPLY RecompFrontend tools/RecompFrontend $FRONTEND_FILES
 web_since N64Recomp tools/N64Recomp src/analysis.cpp
 cmake -P $APPLY N64Recomp tools/N64Recomp src/analysis.cpp
+web_state > "$STAMP"
